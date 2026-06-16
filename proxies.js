@@ -22,6 +22,6 @@ module.exports = [
 
   // ── Coloque seus proxies reais abaixo ──
   "socks5://JKzslVL4:jRV6syuwKP@181.215.11.218:50101",
-  "socks5://JKzslVL4:jRV6syuwKP@181.215.11.218:50101",
+  "socks5://o41LLJbh:BuskqgTe@185.14.238.22:10943",
 ];
  
