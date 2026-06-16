@@ -21,5 +21,6 @@ module.exports = [
   // "http://103.83.232.122:80",
 
   // ── Coloque seus proxies reais abaixo ──
-  "socks5://181.215.11.218:50101:JKzslVL4:jRV6syuwKP",
+  "socks5://JKzslVL4:jRV6syuwKP@181.215.11.218:50101",
 ];
+ 
