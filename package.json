@@ -1,7 +1,7 @@
 {
-  "name": "instagram-profile-pic-api",
+  "name": "instagram-profile-apify-api",
   "version": "1.0.0",
-  "description": "API para buscar foto de perfil do Instagram por @username (fins educacionais)",
+  "description": "API Express para consultar perfis via Apify Actor com cache e rate limit",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
