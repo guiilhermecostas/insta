@@ -3,18 +3,37 @@ const https    = require("https");
 const http     = require("http");
 const net      = require("net");
 const url      = require("url");
+const cors     = require("cors");
 
 const ProxyManager = require("./proxy-manager");
 const proxyList    = require("./proxies");
 
 const app  = express();
+app.use(cors());
 const PORT = process.env.PORT || 3000;
+
+// ─── Cache em memória (1 hora de TTL) ───────────────────────────────────────
+const cache = new Map();
+const CACHE_TTL_MS = 60 * 60 * 1000;
+
+function cacheGet(key) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { cache.delete(key); return null; }
+  console.log(`✅ Cache hit: ${key}`);
+  return entry.value;
+}
+
+function cacheSet(key, value) {
+  cache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
+  console.log(`💾 Cache set: ${key} (expira em 1h)`);
+}
 
 // ─── Inicializa o pool de proxies ────────────────────────────────────────────
 const proxyManager = new ProxyManager(proxyList);
 console.log(`🔌 Pool de proxies inicializado com ${proxyList.length} proxies`);
 
-// ─── User-Agents para rotacionar junto com os proxies ────────────────────────
+// ─── User-Agents para rotacionar ─────────────────────────────────────────────
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -45,10 +64,6 @@ function getBrowserHeaders() {
 //  TUNNEL HTTP/HTTPS ATRAVÉS DO PROXY
 // ════════════════════════════════════════════════════════════════════════════
 
-/**
- * Cria um socket tunelado via proxy HTTP CONNECT (para requisições HTTPS).
- * Suporta proxies HTTP e SOCKS5.
- */
 function createTunnel(proxyUrl, targetHost, targetPort) {
   return new Promise((resolve, reject) => {
     const parsed = new url.URL(proxyUrl);
@@ -60,10 +75,8 @@ function createTunnel(proxyUrl, targetHost, targetPort) {
         .catch(reject);
     }
 
-    // ── Proxy HTTP via CONNECT ────────────────────────────────────────────
     const proxyPort = parseInt(parsed.port) || 8080;
     const proxyHost = parsed.hostname;
-
     const auth = parsed.username
       ? Buffer.from(`${parsed.username}:${parsed.password}`).toString("base64")
       : null;
@@ -73,11 +86,8 @@ function createTunnel(proxyUrl, targetHost, targetPort) {
       `Host: ${targetHost}:${targetPort}`,
       auth ? `Proxy-Authorization: Basic ${auth}` : "",
       "Connection: keep-alive",
-      "",
-      "",
-    ]
-      .filter((l) => l !== undefined)
-      .join("\r\n");
+      "", "",
+    ].filter(Boolean).join("\r\n");
 
     const socket = net.connect(proxyPort, proxyHost, () => {
       socket.write(connectHeaders);
@@ -101,9 +111,6 @@ function createTunnel(proxyUrl, targetHost, targetPort) {
   });
 }
 
-/**
- * Cria um túnel SOCKS5 manual (sem biblioteca externa).
- */
 function createSocks5Tunnel(parsed, targetHost, targetPort) {
   return new Promise((resolve, reject) => {
     const proxyPort = parseInt(parsed.port) || 1080;
@@ -111,7 +118,6 @@ function createSocks5Tunnel(parsed, targetHost, targetPort) {
     const hasAuth   = !!parsed.username;
 
     const socket = net.connect(proxyPort, proxyHost, () => {
-      // Handshake SOCKS5 — negocia autenticação
       const authMethod = hasAuth ? 0x02 : 0x00;
       socket.write(Buffer.from([0x05, 0x01, authMethod]));
     });
@@ -121,9 +127,7 @@ function createSocks5Tunnel(parsed, targetHost, targetPort) {
     socket.on("data", (data) => {
       if (step === "auth-negotiation") {
         if (data[0] !== 0x05) return reject(new Error("Resposta SOCKS5 inválida"));
-
         if (data[1] === 0x02 && hasAuth) {
-          // Envia usuário e senha
           const user = Buffer.from(parsed.username);
           const pass = Buffer.from(parsed.password);
           const authBuf = Buffer.concat([
@@ -142,14 +146,12 @@ function createSocks5Tunnel(parsed, targetHost, targetPort) {
         }
         return;
       }
-
       if (step === "auth-response") {
         if (data[1] !== 0x00) return reject(new Error("SOCKS5: autenticação falhou"));
         step = "connect";
         sendConnect();
         return;
       }
-
       if (step === "connect") {
         if (data[1] !== 0x00) return reject(new Error(`SOCKS5 CONNECT falhou: código ${data[1]}`));
         resolve(socket);
@@ -157,16 +159,14 @@ function createSocks5Tunnel(parsed, targetHost, targetPort) {
     });
 
     function sendConnect() {
-      const hostBuf  = Buffer.from(targetHost);
-      const portBuf  = Buffer.alloc(2);
+      const hostBuf = Buffer.from(targetHost);
+      const portBuf = Buffer.alloc(2);
       portBuf.writeUInt16BE(targetPort);
-
-      const connectBuf = Buffer.concat([
+      socket.write(Buffer.concat([
         Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]),
         hostBuf,
         portBuf,
-      ]);
-      socket.write(connectBuf);
+      ]));
     }
 
     socket.on("error", reject);
@@ -178,14 +178,9 @@ function createSocks5Tunnel(parsed, targetHost, targetPort) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  REQUISIÇÃO COM PROXY + RETRY AUTOMÁTICO
+//  REQUISIÇÃO COM PROXY + RETRY
 // ════════════════════════════════════════════════════════════════════════════
 
-/**
- * Faz GET via proxy. Se falhar, tenta o próximo proxy automaticamente.
- * @param {string} targetUrl - URL de destino
- * @param {number} maxRetries - Quantas trocas de proxy tentar
- */
 async function fetchViaProxy(targetUrl, maxRetries = 3) {
   const parsed  = new url.URL(targetUrl);
   const isHttps = parsed.protocol === "https:";
@@ -198,10 +193,7 @@ async function fetchViaProxy(targetUrl, maxRetries = 3) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const proxy = proxyManager.getNext();
 
-    // Se não houver proxies configurados, faz requisição direta
-    if (!proxy) {
-      return directFetch(targetUrl);
-    }
+    if (!proxy) return directFetch(targetUrl);
 
     try {
       const result = await fetchWithProxy(proxy, host, port, path, isHttps);
@@ -209,14 +201,12 @@ async function fetchViaProxy(targetUrl, maxRetries = 3) {
       return result;
     } catch (err) {
       lastError = err;
-      const isBlocked =
-        err.message.includes("302") ||
-        err.message.includes("401") ||
-        err.message.includes("403") ||
-        err.message.includes("CONNECT falhou");
-
       proxyManager.markFailure(proxy, err.message);
-      console.warn(`↩️  Tentativa ${attempt + 1} falhou (proxy: ${proxy.url}): ${err.message}`);
+      console.warn(`↩️  Tentativa ${attempt + 1} falhou (${proxy.url}): ${err.message}`);
+
+      // Delay crescente entre tentativas
+      const delay = 1000 * (attempt + 1);
+      await new Promise(r => setTimeout(r, delay));
     }
   }
 
@@ -226,7 +216,6 @@ async function fetchViaProxy(targetUrl, maxRetries = 3) {
 function fetchWithProxy(proxy, host, port, path, isHttps) {
   return new Promise(async (resolve, reject) => {
     let socket;
-
     try {
       socket = await createTunnel(proxy.url, host, port);
     } catch (err) {
@@ -235,10 +224,7 @@ function fetchWithProxy(proxy, host, port, path, isHttps) {
 
     const headers = getBrowserHeaders();
     const reqOptions = {
-      host,
-      path,
-      headers,
-      method: "GET",
+      host, path, headers, method: "GET",
       createConnection: () => {
         if (isHttps) {
           const tls = require("tls");
@@ -251,35 +237,26 @@ function fetchWithProxy(proxy, host, port, path, isHttps) {
     const protocol = isHttps ? https : http;
     const req = protocol.request(reqOptions, (res) => {
       let data = "";
-
       if (res.statusCode === 301 || res.statusCode === 302) {
         socket.destroy();
-        return reject(new Error(`Redirecionado (${res.statusCode}) — proxy bloqueado ou Instagram detectou`));
+        return reject(new Error(`Redirecionado (${res.statusCode}) — bloqueado`));
       }
-
       res.on("data", (chunk) => (data += chunk));
       res.on("end", () => resolve({ status: res.statusCode, body: data }));
     });
 
-    req.on("error", (err) => {
-      socket.destroy();
-      reject(err);
-    });
-
+    req.on("error", (err) => { socket.destroy(); reject(err); });
     req.setTimeout(12000, () => {
-      req.destroy();
-      socket.destroy();
+      req.destroy(); socket.destroy();
       reject(new Error("Timeout na requisição"));
     });
-
     req.end();
   });
 }
 
-// Fallback: requisição direta sem proxy
 function directFetch(targetUrl) {
   return new Promise((resolve, reject) => {
-    console.warn("⚠️  Nenhum proxy disponível. Fazendo requisição direta.");
+    console.warn("⚠️  Nenhum proxy disponível. Requisição direta.");
     const req = https.get(targetUrl, { headers: getBrowserHeaders(), timeout: 10000 }, (res) => {
       let data = "";
       res.on("data", (c) => (data += c));
@@ -295,13 +272,15 @@ function directFetch(targetUrl) {
 // ════════════════════════════════════════════════════════════════════════════
 
 async function fetchInstagramProfile(username) {
-  const igUrl = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
+  // Verifica cache primeiro
+  const cached = cacheGet(username);
+  if (cached) return cached;
 
+  const igUrl = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
   const { status, body } = await fetchViaProxy(igUrl);
 
-  if (status !== 200) {
-    throw new Error(`Instagram retornou status ${status}`);
-  }
+  if (status === 429) throw new Error("Instagram bloqueou temporariamente (429). Tente em alguns minutos.");
+  if (status !== 200) throw new Error(`Instagram retornou status ${status}`);
 
   let json;
   try {
@@ -313,19 +292,23 @@ async function fetchInstagramProfile(username) {
   const user = json?.data?.user;
   if (!user) throw new Error("Usuário não encontrado ou perfil privado");
 
-  return {
-    username:         user.username,
-    full_name:        user.full_name,
-    biography:        user.biography,
-    is_private:       user.is_private,
-    is_verified:      user.is_verified,
-    followers:        user.edge_followed_by?.count ?? null,
-    following:        user.edge_follow?.count ?? null,
-    posts_count:      user.edge_owner_to_timeline_media?.count ?? null,
-    profile_pic_url:  user.profile_pic_url,
+  const profile = {
+    username:           user.username,
+    full_name:          user.full_name,
+    biography:          user.biography,
+    is_private:         user.is_private,
+    is_verified:        user.is_verified,
+    followers:          user.edge_followed_by?.count ?? null,
+    following:          user.edge_follow?.count ?? null,
+    posts_count:        user.edge_owner_to_timeline_media?.count ?? null,
+    profile_pic_url:    user.profile_pic_url,
     profile_pic_url_hd: user.profile_pic_url_hd,
-    external_url:     user.external_url ?? null,
+    external_url:       user.external_url ?? null,
   };
+
+  // Salva no cache
+  cacheSet(username, profile);
+  return profile;
 }
 
 function validateUsername(username) {
@@ -336,21 +319,19 @@ function validateUsername(username) {
 //  ROTAS
 // ════════════════════════════════════════════════════════════════════════════
 
-// GET /  →  info + status dos proxies
 app.get("/", (req, res) => {
   res.json({
-    name: "Instagram Profile Pic API (com proxy rotation)",
+    name: "Instagram Profile Pic API",
     endpoints: {
-      "GET /profile/:username":  "JSON completo do perfil",
-      "GET /pic/:username":      "Redirect para foto em HD",
-      "GET /pic-proxy/:username":"Proxy da foto (resolve CORS)",
-      "GET /proxies/status":     "Status do pool de proxies",
+      "GET /profile/:username":   "JSON completo do perfil",
+      "GET /pic/:username":       "Redirect para foto em HD",
+      "GET /pic-proxy/:username": "Proxy da foto (resolve CORS)",
+      "GET /proxies/status":      "Status do pool de proxies",
+      "GET /cache/status":        "Status do cache",
     },
-    examples: ["/profile/cristiano", "/pic/cristiano", "/proxies/status"],
   });
 });
 
-// GET /profile/:username
 app.get("/profile/:username", async (req, res) => {
   const { username } = req.params;
   if (!validateUsername(username))
@@ -360,14 +341,13 @@ app.get("/profile/:username", async (req, res) => {
     const profile = await fetchInstagramProfile(username);
     if (profile.is_private)
       return res.status(403).json({ error: "Perfil privado.", username: profile.username });
-
     return res.json({ ok: true, data: profile });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: err.message });
+    const status = err.message.includes("429") ? 429 : 500;
+    return res.status(status).json({ ok: false, error: err.message });
   }
 });
 
-// GET /pic/:username  →  redirect para a imagem
 app.get("/pic/:username", async (req, res) => {
   const { username } = req.params;
   if (!validateUsername(username))
@@ -375,16 +355,13 @@ app.get("/pic/:username", async (req, res) => {
 
   try {
     const profile = await fetchInstagramProfile(username);
-    if (profile.is_private)
-      return res.status(403).json({ error: "Perfil privado." });
-
+    if (profile.is_private) return res.status(403).json({ error: "Perfil privado." });
     return res.redirect(profile.profile_pic_url_hd || profile.profile_pic_url);
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// GET /pic-proxy/:username  →  serve a imagem diretamente (resolve CORS)
 app.get("/pic-proxy/:username", async (req, res) => {
   const { username } = req.params;
   if (!validateUsername(username))
@@ -392,11 +369,9 @@ app.get("/pic-proxy/:username", async (req, res) => {
 
   try {
     const profile = await fetchInstagramProfile(username);
-    if (profile.is_private)
-      return res.status(403).json({ error: "Perfil privado." });
+    if (profile.is_private) return res.status(403).json({ error: "Perfil privado." });
 
     const imageUrl = profile.profile_pic_url_hd || profile.profile_pic_url;
-
     https.get(imageUrl, { headers: getBrowserHeaders() }, (imgRes) => {
       res.setHeader("Content-Type", imgRes.headers["content-type"] || "image/jpeg");
       res.setHeader("Cache-Control", "public, max-age=3600");
@@ -407,14 +382,28 @@ app.get("/pic-proxy/:username", async (req, res) => {
   }
 });
 
-// GET /proxies/status  →  saúde do pool de proxies
 app.get("/proxies/status", (req, res) => {
   res.json(proxyManager.getStatus());
 });
 
-// ─── Start ──────────────────────────────────────────────────────────────────
+// Novo: status do cache
+app.get("/cache/status", (req, res) => {
+  const now = Date.now();
+  const entries = [...cache.entries()].map(([key, val]) => ({
+    username: key,
+    expiresIn: Math.ceil((val.expiresAt - now) / 1000) + "s",
+  }));
+  res.json({ total: cache.size, entries });
+});
+
+// Novo: limpar cache manualmente
+app.delete("/cache", (req, res) => {
+  cache.clear();
+  res.json({ ok: true, message: "Cache limpo." });
+});
+
 app.listen(PORT, () => {
   console.log(`\n🚀 Servidor rodando em http://localhost:${PORT}`);
-  console.log(`📸 Teste: http://localhost:${PORT}/profile/cristiano`);
-  console.log(`🔌 Status dos proxies: http://localhost:${PORT}/proxies/status\n`);
+  console.log(`💾 Cache ativo — TTL: 1 hora`);
+  console.log(`📸 Teste: http://localhost:${PORT}/profile/cristiano\n`);
 });
