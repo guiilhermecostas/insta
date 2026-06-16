@@ -126,6 +126,25 @@ function shuffle(array) {
   return array;
 }
 
+
+function resolveAfter(ms, value) {
+  return new Promise((resolve) => setTimeout(() => resolve(value), ms));
+}
+
+async function firstNonEmpty(promises, timeoutMs = 8500) {
+  const wrapped = promises.map((promise) =>
+    promise.then((items) => {
+      if (Array.isArray(items) && items.length) return items;
+      throw new Error("empty");
+    })
+  );
+
+  return Promise.race([
+    Promise.any(wrapped).catch(() => []),
+    resolveAfter(timeoutMs, []),
+  ]);
+}
+
 async function fetchFollowersFromApify(username, poolLimit = FOLLOWERS_SAMPLE_POOL) {
   const normalizedUsername = username.toLowerCase();
   const cacheKey = `followers:${normalizedUsername}:${poolLimit}`;
@@ -450,6 +469,31 @@ async function fetchStoriesSample(username, poolLimit = STORIES_SAMPLE_POOL) {
   return shuffle(await fetchPostFallbackSample(username, poolLimit).catch(() => []));
 }
 
+
+async function fetchStoriesSampleFast(username, poolLimit = 4) {
+  const targetPool = Math.min(Math.max(poolLimit || 4, 4), 8);
+  const jobs = [];
+
+  if (APIFY_STORIES_SESSION_COOKIE) {
+    jobs.push(fetchAuthenticatedStoriesSample(username, targetPool).catch(() => []));
+  }
+
+  // Stories e highlights em paralelo. A rota rápida não espera eternamente.
+  jobs.push(Promise.all([
+    fetchStoriesAction(username, "stories", targetPool).catch(() => []),
+    fetchStoriesAction(username, "highlights", targetPool).catch(() => []),
+  ]).then(([stories, highlights]) => shuffle([...stories, ...highlights])));
+
+  const direct = await firstNonEmpty(jobs, Number(process.env.STORIES_FAST_TIMEOUT_MS || 7000));
+  if (direct.length) return shuffle(direct);
+
+  // Fallback rápido: tenta posts públicos por pouco tempo. Se não vier, o front usa fictício.
+  return await Promise.race([
+    fetchPostFallbackSample(username, targetPool).then((items) => shuffle(items)).catch(() => []),
+    resolveAfter(Number(process.env.STORIES_FALLBACK_TIMEOUT_MS || 2500), []),
+  ]);
+}
+
 async function fetchInstagramProfile(username) {
   const normalizedUsername = username.toLowerCase();
 
@@ -570,6 +614,8 @@ app.get("/health", (req, res) => {
     auth_stories_actor: APIFY_AUTH_STORIES_ACTOR_ID,
     stories_session_cookie_configured: Boolean(APIFY_STORIES_SESSION_COOKIE),
     stories_sample_pool: STORIES_SAMPLE_POOL,
+    stories_fast_timeout_ms: Number(process.env.STORIES_FAST_TIMEOUT_MS || 7000),
+    stories_fallback_timeout_ms: Number(process.env.STORIES_FALLBACK_TIMEOUT_MS || 2500),
     cache_entries: cache.size,
     cache_ttl_hours: CACHE_TTL_MS / 1000 / 60 / 60,
   });
@@ -671,11 +717,14 @@ app.get("/stories-sample/:username", async (req, res) => {
   if (!validateUsername(username)) return res.status(400).json({ ok: false, error: "Username inválido." });
 
   const limit = Math.min(Math.max(Number(req.query.limit || 4), 1), 4);
-  const requestedPool = Number(req.query.pool || STORIES_SAMPLE_POOL);
-  const poolLimit = Math.min(Math.max(requestedPool, limit), 30);
+  const isFast = String(req.query.fast || "") === "1";
+  const requestedPool = Number(req.query.pool || (isFast ? 4 : STORIES_SAMPLE_POOL));
+  const poolLimit = Math.min(Math.max(requestedPool, limit), isFast ? 8 : 30);
 
   try {
-    const media = await fetchStoriesSample(username, poolLimit);
+    const media = isFast
+      ? await fetchStoriesSampleFast(username, poolLimit)
+      : await fetchStoriesSample(username, poolLimit);
     const baseUrl = `${req.protocol}://${req.get("host")}`;
 
     const sample = shuffle([...media])
@@ -701,6 +750,7 @@ app.get("/stories-sample/:username", async (req, res) => {
         username,
         sample_count: sample.length,
         pool_count: media.length,
+        fast_mode: isFast,
         fallback_used: sample.some((item) => item.source === "post_fallback"),
         media: sample,
       },
