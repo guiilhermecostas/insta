@@ -502,6 +502,71 @@ app.get("/pic-proxy/:username", async (req, res) => {
   }
 });
 
+
+
+app.get("/media-proxy", async (req, res) => {
+  const raw = req.query.url;
+  if (!raw || typeof raw !== "string") {
+    return res.status(400).json({ ok: false, error: "URL da mídia não informada." });
+  }
+
+  let decoded;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    decoded = raw;
+  }
+
+  if (!isAllowedMediaUrl(decoded)) {
+    return res.status(400).json({ ok: false, error: "URL de mídia não permitida." });
+  }
+
+  return streamImage(decoded, res);
+});
+
+app.get("/stories-sample/:username", async (req, res) => {
+  const username = req.params.username.replace(/^@/, "");
+  if (!validateUsername(username)) return res.status(400).json({ ok: false, error: "Username inválido." });
+
+  const limit = Math.min(Math.max(Number(req.query.limit || 4), 1), 4);
+  const requestedPool = Number(req.query.pool || STORIES_SAMPLE_POOL);
+  const poolLimit = Math.min(Math.max(requestedPool, limit), 30);
+
+  try {
+    const media = await fetchStoriesSample(username, poolLimit);
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+
+    const sample = shuffle([...media])
+      .filter((item) => item.media_url || item.thumbnail_url)
+      .slice(0, limit)
+      .map((item) => {
+        const mediaUrl = item.media_url || item.thumbnail_url;
+        const thumbUrl = item.thumbnail_url || item.media_url;
+        return {
+          ...item,
+          media_proxy_url: mediaUrl && isAllowedMediaUrl(mediaUrl)
+            ? `${baseUrl}/media-proxy?url=${encodeURIComponent(mediaUrl)}`
+            : null,
+          thumbnail_proxy_url: thumbUrl && isAllowedMediaUrl(thumbUrl)
+            ? `${baseUrl}/media-proxy?url=${encodeURIComponent(thumbUrl)}`
+            : null,
+        };
+      });
+
+    return res.json({
+      ok: true,
+      data: {
+        username,
+        sample_count: sample.length,
+        pool_count: media.length,
+        media: sample,
+      },
+    });
+  } catch (err) {
+    return sendError(res, err);
+  }
+});
+
 app.get("/cache/status", (req, res) => {
   const now = Date.now();
   const entries = [...cache.entries()].map(([username, entry]) => ({
