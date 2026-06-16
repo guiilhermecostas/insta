@@ -12,6 +12,8 @@ app.set("trust proxy", true);
 const PORT = process.env.PORT || 3000;
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const APIFY_ACTOR_ID = process.env.APIFY_ACTOR_ID || "apify~instagram-profile-scraper";
+const APIFY_FOLLOWERS_ACTOR_ID = process.env.APIFY_FOLLOWERS_ACTOR_ID || "barefoot_year~instagram-followers-scraper";
+const FOLLOWERS_SAMPLE_POOL = Math.min(Math.max(Number(process.env.FOLLOWERS_SAMPLE_POOL || 30), 5), 100);
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_HOURS || 24) * 60 * 60 * 1000;
 const REQUEST_COOLDOWN_MS = Number(process.env.REQUEST_COOLDOWN_SECONDS || 5) * 1000;
 
@@ -82,6 +84,96 @@ function normalizeApifyProfile(item, fallbackUsername) {
     source: "apify",
   };
 }
+function normalizeApifyFollower(item) {
+  const username = pick(
+    item.username,
+    item.userName,
+    item.handle,
+    item.ownerUsername,
+    item.profileUsername,
+    item.name
+  );
+
+  const clean = username ? String(username).replace(/^@+/, "") : null;
+
+  return {
+    username: clean,
+    full_name: pick(item.fullName, item.full_name, item.name, item.displayName, ""),
+    profile_pic_url: pick(
+      item.profilePicUrl,
+      item.profilePictureUrl,
+      item.profile_pic_url,
+      item.profilePicUrlHD,
+      item.avatar,
+      item.imageUrl,
+      null
+    ),
+    profile_url: pick(item.profileUrl, item.profile_url, item.url, clean ? `https://www.instagram.com/${clean}` : null),
+    is_private: Boolean(pick(item.isPrivate, item.private, false)),
+    is_verified: Boolean(pick(item.isVerified, item.verified, false)),
+  };
+}
+
+function shuffle(array) {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+  return array;
+}
+
+async function fetchFollowersFromApify(username, poolLimit = FOLLOWERS_SAMPLE_POOL) {
+  const normalizedUsername = username.toLowerCase();
+  const cacheKey = `followers:${normalizedUsername}:${poolLimit}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  if (!APIFY_TOKEN) {
+    throw new ApiError("APIFY_TOKEN não configurado no ambiente.", 500);
+  }
+
+  const endpoint = `https://api.apify.com/v2/acts/${APIFY_FOLLOWERS_ACTOR_ID}/run-sync-get-dataset-items?token=${encodeURIComponent(APIFY_TOKEN)}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000);
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: normalizedUsername,
+        profileUrl: "",
+        maxFollowers: poolLimit,
+      }),
+      signal: controller.signal,
+    });
+
+    const data = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const message = data?.error?.message || data?.message || `Apify Followers retornou status ${response.status}`;
+      throw new ApiError(message, response.status);
+    }
+
+    const items = Array.isArray(data) ? data : [];
+    const followers = items
+      .map(normalizeApifyFollower)
+      .filter((f) => f.username);
+
+    cacheSet(cacheKey, followers);
+    return followers;
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new ApiError("Timeout ao consultar seguidores na Apify.", 504);
+    }
+    if (err instanceof ApiError) throw err;
+    throw new ApiError(err.message || "Erro ao consultar seguidores na Apify.", 500);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 
 async function fetchInstagramProfile(username) {
   const normalizedUsername = username.toLowerCase();
@@ -181,6 +273,7 @@ app.get("/", (req, res) => {
     name: "Instagram Profile API via Apify",
     endpoints: {
       "GET /profile/:username": "Consulta perfil via Apify com cache",
+      "GET /followers-sample/:username?limit=5": "Retorna até 5 seguidores públicos aleatórios como amostra",
       "GET /pic/:username": "Redirect para foto do perfil",
       "GET /pic-proxy/:username": "Proxy da foto",
       "GET /cache/status": "Status do cache",
@@ -195,6 +288,8 @@ app.get("/health", (req, res) => {
     ok: true,
     apify_token_configured: Boolean(APIFY_TOKEN),
     actor: APIFY_ACTOR_ID,
+    followers_actor: APIFY_FOLLOWERS_ACTOR_ID,
+    followers_sample_pool: FOLLOWERS_SAMPLE_POOL,
     cache_entries: cache.size,
     cache_ttl_hours: CACHE_TTL_MS / 1000 / 60 / 60,
   });
@@ -207,6 +302,32 @@ app.get("/profile/:username", antiSpam, async (req, res) => {
   try {
     const profile = await fetchInstagramProfile(username);
     return res.json({ ok: true, data: profile });
+  } catch (err) {
+    return sendError(res, err);
+  }
+});
+
+app.get("/followers-sample/:username", async (req, res) => {
+  const username = req.params.username.replace(/^@/, "");
+  if (!validateUsername(username)) return res.status(400).json({ ok: false, error: "Username inválido." });
+
+  const limit = Math.min(Math.max(Number(req.query.limit || 5), 1), 5);
+  const requestedPool = Number(req.query.pool || FOLLOWERS_SAMPLE_POOL);
+  const poolLimit = Math.min(Math.max(requestedPool, limit), 100);
+
+  try {
+    const followers = await fetchFollowersFromApify(username, poolLimit);
+    const sample = shuffle([...followers]).slice(0, limit);
+
+    return res.json({
+      ok: true,
+      data: {
+        username,
+        sample_count: sample.length,
+        pool_count: followers.length,
+        followers: sample,
+      },
+    });
   } catch (err) {
     return sendError(res, err);
   }
