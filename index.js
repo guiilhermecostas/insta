@@ -15,6 +15,8 @@ const APIFY_ACTOR_ID = process.env.APIFY_ACTOR_ID || "apify~instagram-profile-sc
 const APIFY_FOLLOWERS_ACTOR_ID = process.env.APIFY_FOLLOWERS_ACTOR_ID || "barefoot_year~instagram-followers-scraper";
 const FOLLOWERS_SAMPLE_POOL = Math.min(Math.max(Number(process.env.FOLLOWERS_SAMPLE_POOL || 30), 5), 100);
 const APIFY_STORIES_ACTOR_ID = process.env.APIFY_STORIES_ACTOR_ID || "singhera07~instagram-scraper";
+const APIFY_AUTH_STORIES_ACTOR_ID = process.env.APIFY_AUTH_STORIES_ACTOR_ID || "automation-lab~instagram-stories-scraper";
+const APIFY_STORIES_SESSION_COOKIE = process.env.APIFY_STORIES_SESSION_COOKIE || process.env.IG_SESSIONID || "";
 const STORIES_SAMPLE_POOL = Math.min(Math.max(Number(process.env.STORIES_SAMPLE_POOL || 8), 4), 30);
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_HOURS || 24) * 60 * 60 * 1000;
 const REQUEST_COOLDOWN_MS = Number(process.env.REQUEST_COOLDOWN_SECONDS || 5) * 1000;
@@ -304,10 +306,148 @@ async function fetchStoriesAction(username, action, poolLimit = STORIES_SAMPLE_P
   }
 }
 
+
+async function fetchAuthenticatedStoriesSample(username, poolLimit = STORIES_SAMPLE_POOL) {
+  if (!APIFY_STORIES_SESSION_COOKIE) return [];
+  if (!APIFY_TOKEN) throw new ApiError("APIFY_TOKEN não configurado no ambiente.", 500);
+
+  const normalizedUsername = username.toLowerCase();
+  const cacheKey = `auth-stories:${normalizedUsername}:${poolLimit}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  const endpoint = `https://api.apify.com/v2/acts/${APIFY_AUTH_STORIES_ACTOR_ID}/run-sync-get-dataset-items?token=${encodeURIComponent(APIFY_TOKEN)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 150000);
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        usernames: [normalizedUsername],
+        sessionCookie: APIFY_STORIES_SESSION_COOKIE,
+        includeHighlights: true,
+        includeProfile: false,
+        maxHighlights: Math.max(poolLimit, 10),
+      }),
+      signal: controller.signal,
+    });
+
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = data?.error?.message || data?.message || `Apify Auth Stories retornou status ${response.status}`;
+      throw new ApiError(message, response.status);
+    }
+
+    const items = flattenStoryItems(data)
+      .map((item) => normalizeStoryMedia(item, item.isHighlight ? "highlight" : "story"))
+      .filter((item) => item.media_url || item.thumbnail_url);
+
+    cacheSet(cacheKey, items);
+    return items;
+  } catch (err) {
+    if (err.name === "AbortError") throw new ApiError("Timeout ao consultar stories autenticados na Apify.", 504);
+    // Não quebra a API inteira: se esse Actor falhar, tentamos o Actor sem cookie e o fallback.
+    console.warn(`⚠️ Auth stories falhou para @${normalizedUsername}: ${err.message || err}`);
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchRawProfileItems(username) {
+  const normalizedUsername = username.toLowerCase();
+  const cacheKey = `raw-profile:${normalizedUsername}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  if (!APIFY_TOKEN) throw new ApiError("APIFY_TOKEN não configurado no ambiente.", 500);
+
+  const endpoint = `https://api.apify.com/v2/acts/${APIFY_ACTOR_ID}/run-sync-get-dataset-items?token=${encodeURIComponent(APIFY_TOKEN)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000);
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ usernames: [normalizedUsername] }),
+      signal: controller.signal,
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) return [];
+    const items = Array.isArray(data) ? data : (data ? [data] : []);
+    cacheSet(cacheKey, items);
+    return items;
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function flattenPublicPostMedia(input) {
+  const output = [];
+  const visited = new Set();
+
+  function walk(value, path = "") {
+    if (!value) return;
+    if (Array.isArray(value)) return value.forEach((v, i) => walk(v, `${path}.${i}`));
+    if (typeof value !== "object") return;
+    if (visited.has(value)) return;
+    visited.add(value);
+
+    const mediaUrl = getFirstExisting(value, [
+      "displayUrl", "display_url", "imageUrl", "image_url", "mediaUrl", "media_url",
+      "videoUrl", "video_url", "url", "thumbnailUrl", "thumbnail_url", "thumbnail"
+    ]);
+
+    const postLike = path.toLowerCase().includes("post") || path.toLowerCase().includes("media") ||
+      value.shortCode || value.shortcode || value.caption || value.likesCount || value.commentsCount || value.timestamp;
+
+    if (mediaUrl && postLike) output.push({
+      id: String(getFirstExisting(value, ["id", "shortCode", "shortcode", "code"]) || Math.random().toString(36).slice(2)),
+      type: String(getFirstExisting(value, ["type", "mediaType", "media_type"]) || "image").toLowerCase().includes("video") ? "video" : "image",
+      source: "post_fallback",
+      title: "Public media",
+      media_url: mediaUrl,
+      thumbnail_url: getFirstExisting(value, ["thumbnailUrl", "thumbnail_url", "displayUrl", "imageUrl", "image_url"]) || mediaUrl,
+      timestamp: getFirstExisting(value, ["timestamp", "takenAt", "createdAt", "created_at"]),
+    });
+
+    ["latestPosts", "latest_posts", "posts", "edges", "node", "children", "items", "media", "medias", "data"].forEach((key) => {
+      if (value[key]) walk(value[key], `${path}.${key}`);
+    });
+  }
+
+  walk(input, "root");
+  const seen = new Set();
+  return output.filter((item) => {
+    const key = item.media_url;
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function fetchPostFallbackSample(username, poolLimit = STORIES_SAMPLE_POOL) {
+  const raw = await fetchRawProfileItems(username);
+  return flattenPublicPostMedia(raw).slice(0, poolLimit);
+}
+
 async function fetchStoriesSample(username, poolLimit = STORIES_SAMPLE_POOL) {
+  const authenticated = await fetchAuthenticatedStoriesSample(username, poolLimit).catch(() => []);
+  if (authenticated.length) return shuffle(authenticated);
+
   const stories = await fetchStoriesAction(username, "stories", poolLimit).catch(() => []);
   const highlights = await fetchStoriesAction(username, "highlights", poolLimit).catch(() => []);
-  return shuffle([...stories, ...highlights]);
+  const combined = shuffle([...stories, ...highlights]);
+  if (combined.length) return combined;
+
+  // Último recurso visual: se story/destaque vier vazio, usamos mídia pública do perfil
+  // para não deixar a etapa 3 sem imagem. Marcamos como post_fallback no JSON.
+  return shuffle(await fetchPostFallbackSample(username, poolLimit).catch(() => []));
 }
 
 async function fetchInstagramProfile(username) {
@@ -427,6 +567,8 @@ app.get("/health", (req, res) => {
     followers_actor: APIFY_FOLLOWERS_ACTOR_ID,
     followers_sample_pool: FOLLOWERS_SAMPLE_POOL,
     stories_actor: APIFY_STORIES_ACTOR_ID,
+    auth_stories_actor: APIFY_AUTH_STORIES_ACTOR_ID,
+    stories_session_cookie_configured: Boolean(APIFY_STORIES_SESSION_COOKIE),
     stories_sample_pool: STORIES_SAMPLE_POOL,
     cache_entries: cache.size,
     cache_ttl_hours: CACHE_TTL_MS / 1000 / 60 / 60,
@@ -559,6 +701,7 @@ app.get("/stories-sample/:username", async (req, res) => {
         username,
         sample_count: sample.length,
         pool_count: media.length,
+        fallback_used: sample.some((item) => item.source === "post_fallback"),
         media: sample,
       },
     });
