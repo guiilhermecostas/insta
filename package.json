@@ -1,0 +1,19 @@
+{
+  "name": "instagram-profile-pic-api",
+  "version": "1.0.0",
+  "description": "API para buscar foto de perfil do Instagram por @username (fins educacionais)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
