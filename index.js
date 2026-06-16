@@ -317,7 +317,12 @@ app.get("/followers-sample/:username", async (req, res) => {
 
   try {
     const followers = await fetchFollowersFromApify(username, poolLimit);
-    const sample = shuffle([...followers]).slice(0, limit);
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const sample = shuffle([...followers]).slice(0, limit).map((follower) => ({
+      ...follower,
+      // URL estável para o frontend exibir a foto sem depender direto do CDN do Instagram.
+      profile_pic_proxy_url: `${baseUrl}/pic-proxy/${encodeURIComponent(follower.username)}`,
+    }));
 
     return res.json({
       ok: true,
