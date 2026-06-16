@@ -3,6 +3,7 @@ const https    = require("https");
 const http     = require("http");
 const net      = require("net");
 const url      = require("url");
+const zlib     = require("zlib");
 const cors     = require("cors");
 
 const ProxyManager = require("./proxy-manager");
@@ -44,6 +45,38 @@ const USER_AGENTS = [
 
 function randomUA() {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+function maskProxyUrl(proxyUrl = "") {
+  return proxyUrl.replace(/\/\/[^@]+@/, "//***:***@");
+}
+
+function readResponseBody(res) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+
+    res.on("data", (chunk) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+
+    res.on("end", () => {
+      const buffer = Buffer.concat(chunks);
+      const encoding = String(res.headers["content-encoding"] || "").toLowerCase();
+
+      const finish = (err, output) => {
+        if (err) return reject(err);
+        resolve(output.toString("utf8"));
+      };
+
+      if (encoding.includes("br")) return zlib.brotliDecompress(buffer, finish);
+      if (encoding.includes("gzip")) return zlib.gunzip(buffer, finish);
+      if (encoding.includes("deflate")) return zlib.inflate(buffer, finish);
+
+      resolve(buffer.toString("utf8"));
+    });
+
+    res.on("error", reject);
+  });
 }
 
 function getBrowserHeaders() {
@@ -202,12 +235,19 @@ async function fetchViaProxy(targetUrl, maxRetries = 3) {
     } catch (err) {
       lastError = err;
       proxyManager.markFailure(proxy, err.message);
-      console.warn(`↩️  Tentativa ${attempt + 1} falhou (${proxy.url}): ${err.message}`);
+      console.warn(`↩️  Tentativa ${attempt + 1} falhou (${maskProxyUrl(proxy.url)}): ${err.message}`);
 
       // Delay crescente entre tentativas
       const delay = 1000 * (attempt + 1);
       await new Promise(r => setTimeout(r, delay));
     }
+  }
+
+  // Se os proxies estiverem fora do ar, tenta direto por padrão.
+  // Para desativar: DIRECT_FALLBACK=false npm start
+  if (process.env.DIRECT_FALLBACK !== "false") {
+    console.warn("⚠️  Todos os proxies falharam. Tentando requisição direta como fallback.");
+    return directFetch(targetUrl);
   }
 
   throw new Error(`Falhou após ${maxRetries + 1} tentativas. Último erro: ${lastError?.message}`);
@@ -235,14 +275,18 @@ function fetchWithProxy(proxy, host, port, path, isHttps) {
     };
 
     const protocol = isHttps ? https : http;
-    const req = protocol.request(reqOptions, (res) => {
-      let data = "";
-      if (res.statusCode === 301 || res.statusCode === 302) {
+    const req = protocol.request(reqOptions, async (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
         socket.destroy();
-        return reject(new Error(`Redirecionado (${res.statusCode}) — bloqueado`));
+        return reject(new Error(`Redirecionado (${res.statusCode}) — location: ${res.headers.location || "sem location"}`));
       }
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => resolve({ status: res.statusCode, body: data }));
+
+      try {
+        const body = await readResponseBody(res);
+        resolve({ status: res.statusCode, body });
+      } catch (err) {
+        reject(new Error(`Falha ao ler/descompactar resposta: ${err.message}`));
+      }
     });
 
     req.on("error", (err) => { socket.destroy(); reject(err); });
@@ -256,14 +300,26 @@ function fetchWithProxy(proxy, host, port, path, isHttps) {
 
 function directFetch(targetUrl) {
   return new Promise((resolve, reject) => {
-    console.warn("⚠️  Nenhum proxy disponível. Requisição direta.");
-    const req = https.get(targetUrl, { headers: getBrowserHeaders(), timeout: 10000 }, (res) => {
-      let data = "";
-      res.on("data", (c) => (data += c));
-      res.on("end", () => resolve({ status: res.statusCode, body: data }));
+    console.warn("⚠️  Requisição direta.");
+
+    const parsed = new url.URL(targetUrl);
+    const protocol = parsed.protocol === "http:" ? http : https;
+
+    const req = protocol.get(targetUrl, { headers: getBrowserHeaders(), timeout: 12000 }, async (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+        return reject(new Error(`Redirecionado (${res.statusCode}) — location: ${res.headers.location || "sem location"}`));
+      }
+
+      try {
+        const body = await readResponseBody(res);
+        resolve({ status: res.statusCode, body });
+      } catch (err) {
+        reject(new Error(`Falha ao ler/descompactar resposta: ${err.message}`));
+      }
     });
+
     req.on("error", reject);
-    req.on("timeout", () => reject(new Error("Timeout direto")));
+    req.on("timeout", () => req.destroy(new Error("Timeout direto")));
   });
 }
 
@@ -313,6 +369,48 @@ async function fetchInstagramProfile(username) {
 
 function validateUsername(username) {
   return /^[\w.]{1,30}$/.test(username);
+}
+
+function getImageHeaders() {
+  const headers = getBrowserHeaders();
+  delete headers["Accept-Encoding"];
+  headers.Accept = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8";
+  return headers;
+}
+
+function streamImage(imageUrl, res, redirects = 0) {
+  if (redirects > 5) {
+    return res.status(508).json({ ok: false, error: "Muitos redirects ao buscar a imagem." });
+  }
+
+  const parsed = new url.URL(imageUrl);
+  const protocol = parsed.protocol === "http:" ? http : https;
+
+  const req = protocol.get(imageUrl, { headers: getImageHeaders(), timeout: 12000 }, (imgRes) => {
+    if ([301, 302, 303, 307, 308].includes(imgRes.statusCode)) {
+      const location = imgRes.headers.location;
+      imgRes.resume();
+      if (!location) return res.status(502).json({ ok: false, error: "Redirect da imagem sem location." });
+      return streamImage(new url.URL(location, imageUrl).toString(), res, redirects + 1);
+    }
+
+    if (imgRes.statusCode !== 200) {
+      imgRes.resume();
+      return res.status(imgRes.statusCode || 502).json({
+        ok: false,
+        error: `Servidor da imagem retornou status ${imgRes.statusCode || "desconhecido"}.`,
+      });
+    }
+
+    res.setHeader("Content-Type", imgRes.headers["content-type"] || "image/jpeg");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    imgRes.pipe(res);
+  });
+
+  req.on("error", (err) => {
+    if (!res.headersSent) res.status(502).json({ ok: false, error: `Erro ao buscar imagem: ${err.message}` });
+  });
+  req.on("timeout", () => req.destroy(new Error("Timeout ao buscar imagem")));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -372,11 +470,7 @@ app.get("/pic-proxy/:username", async (req, res) => {
     if (profile.is_private) return res.status(403).json({ error: "Perfil privado." });
 
     const imageUrl = profile.profile_pic_url_hd || profile.profile_pic_url;
-    https.get(imageUrl, { headers: getBrowserHeaders() }, (imgRes) => {
-      res.setHeader("Content-Type", imgRes.headers["content-type"] || "image/jpeg");
-      res.setHeader("Cache-Control", "public, max-age=3600");
-      imgRes.pipe(res);
-    });
+    return streamImage(imageUrl, res);
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }

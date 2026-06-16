@@ -74,9 +74,13 @@ class ProxyManager {
     if (proxy.failures >= this.MAX_FAILURES) {
       proxy.blockedUntil = Date.now() + this.COOLDOWN_MS;
       console.warn(
-        `🚫 Proxy ${proxy.url} em cooldown por ${this.COOLDOWN_MS / 1000}s. Razão: ${reason}`
+        `🚫 Proxy ${this.maskUrl(proxy.url)} em cooldown por ${this.COOLDOWN_MS / 1000}s. Razão: ${reason}`
       );
     }
+  }
+
+  maskUrl(proxyUrl = "") {
+    return proxyUrl.replace(/\/\/[^@]+@/, "//***:***@");
   }
 
   // ── Status geral do pool (útil para o endpoint /proxies/status) ─────────────
@@ -88,7 +92,7 @@ class ProxyManager {
         (p) => !p.blockedUntil || now >= p.blockedUntil
       ).length,
       proxies: this.proxies.map((p) => ({
-        url: p.url.replace(/:([^@]+)@/, ":***@"), // esconde a senha nos logs
+        url: this.maskUrl(p.url), // esconde usuário e senha
         status:
           p.blockedUntil && now < p.blockedUntil
             ? `cooldown (${Math.ceil((p.blockedUntil - now) / 1000)}s restantes)`
